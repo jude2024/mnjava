@@ -1,0 +1,729 @@
+1. Installation
+npm init -y
+npm install fastify @fastify/cors better-sqlite3 bcryptjs
+npm install -D typescript ts-node-dev @types/node @types/bcryptjs
+
+ tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "rootDir": ".",
+    "outDir": "dist",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts", "frontend/**/*.ts"]
+}
+
+src/db.ts
+
+import Database from "better-sqlite3";
+
+export const db = new Database("pointeuse.db");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    login TEXT NOT NULL UNIQUE,
+    password TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS pointages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('arrivee', 'depart')),
+    datetime TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+`);
+
+export type User = {
+  id: number;
+  login: string;
+  password: string;
+};
+
+export type Pointage = {
+  id: number;
+  user_id: number;
+  type: "arrivee" | "depart";
+  dat
+
+etime: string;
+};
+
+
+src/server.ts
+
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import bcrypt from "bcryptjs";
+import { db, User, Pointage } from "./db";
+
+const app = Fastify({
+  logger: true
+});
+
+app.register(cors, {
+  origin: true
+});
+
+type AuthBody = {
+  login: string;
+  password: string;
+};
+
+function getDateTimeString(): string {
+  const now = new Date();
+
+  return now.toLocaleString("fr-FR", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+}
+
+function findUserByLogin(login: string): User | undefined {
+  return db
+    .prepare("SELECT * FROM users WHERE login = ?")
+    .get(login) as User | undefined;
+}
+
+function authenticate(login: string, password: string): User | null {
+  const user = findUserByLogin(login);
+
+  if (!user) {
+    return null;
+  }
+
+  const validPassword = bcrypt.compareSync(password, user.password);
+
+  if (!validPassword) {
+    return null;
+  }
+
+  return user;
+}
+
+app.get("/", async () => {
+  return {
+    message: "API de pointage en ligne opérationnelle"
+  };
+});
+
+/**
+ * Création de compte
+ */
+app.post("/register", async (request, reply) => {
+  const body = request.body as AuthBody;
+
+  if (!body.login || !body.password) {
+    return reply.code(400).send({
+      error: "Login et mot de passe obligatoires."
+    });
+  }
+
+  const existingUser = findUserByLogin(body.login);
+
+  if (existingUser) {
+    return reply.code(409).send({
+      error: "Ce login existe déjà."
+    });
+  }
+
+  const hashedPassword = bcrypt.hashSync(body.password, 10);
+
+  const insertUser = db.prepare(`
+    INSERT INTO users (login, password)
+    VALUES (?, ?)
+  `);
+
+  insertUser.run(body.login, hashedPassword);
+
+  return reply.code(201).send({
+    message: "Compte créé avec succès."
+  });
+});
+
+/**
+ * Saisie d'arrivée
+ */
+app.post("/arrivee", async (request, reply) => {
+  const body = request.body as AuthBody;
+
+  if (!body.login || !body.password) {
+    return reply.code(400).send({
+      error: "Login et mot de passe obligatoires."
+    });
+  }
+
+  const user = authenticate(body.login, body.password);
+
+  if (!user) {
+    return reply.code(401).send({
+      error: "Identifiants incorrects."
+    });
+  }
+
+  const lastPointage = db
+    .prepare(
+      `
+      SELECT * FROM pointages
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `
+    )
+    .get(user.id) as Pointage | undefined;
+
+  if (lastPointage && lastPointage.type === "arrivee") {
+    return reply.code(400).send({
+      error: "Vous avez déjà indiqué une arrivée sans départ."
+    });
+  }
+
+  const datetime = getDateTimeString();
+
+  db.prepare(
+    `
+    INSERT INTO pointages (user_id, type, datetime)
+    VALUES (?, 'arrivee', ?)
+  `
+  ).run(user.id, datetime);
+
+  return {
+    message: "Arrivée enregistrée avec succès.",
+    datetime
+  };
+});
+
+/**
+ * Saisie de départ
+ */
+app.post("/depart", async (request, reply) => {
+  const body = request.body as AuthBody;
+
+  if (!body.login || !body.password) {
+    return reply.code(400).send({
+      error: "Login et mot de passe obligatoires."
+    });
+  }
+
+  const user = authenticate(body.login, body.password);
+
+  if (!user) {
+    return reply.code(401).send({
+      error: "Identifiants incorrects."
+    });
+  }
+
+  const lastPointage = db
+    .prepare(
+      `
+      SELECT * FROM pointages
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `
+    )
+    .get(user.id) as Pointage | undefined;
+
+  if (!lastPointage || lastPointage.type !== "arrivee") {
+    return reply.code(400).send({
+      error: "Impossible d’indiquer un départ sans arrivée préalable."
+    });
+  }
+
+  const datetime = getDateTimeString();
+
+  db.prepare(
+    `
+    INSERT INTO pointages (user_id, type, datetime)
+    VALUES (?, 'depart', ?)
+  `
+  ).run(user.id, datetime);
+
+  return {
+    message: "Départ enregistré avec succès.",
+    datetime
+  };
+});
+
+/**
+ * Visualisation des horaires
+ */
+app.post("/horaires", async (request, reply) => {
+  const body = request.body as AuthBody;
+
+  if (!body.login || !body.password) {
+    return reply.code(400).send({
+      error: "Login et mot de passe obligatoires."
+    });
+  }
+
+  const user = authenticate(body.login, body.password);
+
+  if (!user) {
+    return reply.code(401).send({
+      error: "Identifiants incorrects."
+    });
+  }
+
+  const pointages = db
+    .prepare(
+      `
+      SELECT type, datetime
+      FROM pointages
+      WHERE user_id = ?
+      ORDER BY id ASC
+    `
+    )
+    .all(user.id);
+
+  return {
+    login: user.login,
+    pointages
+  };
+});
+
+const start = async () => {
+  try {
+    await app.listen({
+      port: 3000,
+      host: "0.0.0.0"
+    });
+
+    console.log("Serveur lancé sur http://localhost:3000");
+  } catch (error) {
+    app.log.error(error);
+    process.exit(1);
+  }
+};
+
+start();
+
+
+frontend/index.html
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pointeuse en ligne</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Pointeuse en ligne</h1>
+    <p>Gestion des arrivées et départs des salariés</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Créer un compte</h2>
+
+      <label for="registerLogin">Login</label>
+      <input type="text" id="registerLogin" placeholder="Votre login" />
+
+      <label for="registerPassword">Mot de passe</label>
+      <input type="password" id="registerPassword" placeholder="Votre mot de passe" />
+
+      <button id="registerBtn">Créer le compte</button>
+
+      <p id="registerMessage" class="message"></p>
+    </section>
+
+    <section class="card">
+      <h2>Indiquer arrivée / départ</h2>
+
+      <label for="pointageLogin">Login</label>
+      <input type="text" id="pointageLogin" placeholder="Votre login" />
+
+      <label for="pointagePassword">Mot de passe</label>
+      <input type="password" id="pointagePassword" placeholder="Votre mot de passe" />
+
+      <div class="buttons">
+        <button id="arriveeBtn" class="success">Arrivée</button>
+        <button id="departBtn" class="danger">Départ</button>
+      </div>
+
+      <p id="pointageMessage" class="message"></p>
+    </section>
+
+    <section class="card">
+      <h2>Visualiser mes horaires</h2>
+
+      <label for="horairesLogin">Login</label>
+      <input type="text" id="horairesLogin" placeholder="Votre login" />
+
+      <label for="horairesPassword">Mot de passe</label>
+      <input type="password" id="horairesPassword" placeholder="Votre mot de passe" />
+
+      <button id="horairesBtn">Afficher mes horaires</button>
+
+      <p id="horairesMessage" class="message"></p>
+
+      <div id="horairesResult"></div>
+    </section>
+  </main>
+
+  <script src="../dist/frontend/app.js"></script>
+</body>
+</html>
+
+frontend/index.html
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #f4f6f8;
+  color: #222;
+}
+
+header {
+  background: #1f4e79;
+  color: white;
+  padding: 25px;
+  text-align: center;
+}
+
+header h1 {
+  margin: 0;
+}
+
+header p {
+  margin-bottom: 0;
+}
+
+main {
+  width: 90%;
+  max-width: 1000px;
+  margin: 30px auto;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 25px;
+}
+
+.card {
+  background: white;
+  padding: 25px;
+  border-radius: 10px;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.12);
+}
+
+.card h2 {
+  margin-top: 0;
+  color: #1f4e79;
+}
+
+label {
+  display: block;
+  margin-top: 15px;
+  font-weight: bold;
+}
+
+input {
+  width: 100%;
+  padding: 12px;
+  margin-top: 6px;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  font-size: 15px;
+}
+
+button {
+  margin-top: 18px;
+  padding: 12px 18px;
+  border: none;
+  border-radius: 6px;
+  background: #1f4e79;
+  color: white;
+  cursor: pointer;
+  font-size: 15px;
+}
+
+button:hover {
+  opacity: 0.9;
+}
+
+.buttons {
+  display: flex;
+  gap: 10px;
+}
+
+.success {
+  background: #198754;
+}
+
+.danger {
+  background: #dc3545;
+}
+
+.message {
+  margin-top: 15px;
+  font-weight: bold;
+}
+
+.success-message {
+  color: #198754;
+}
+
+.error-message {
+  color: #dc3545;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 15px;
+}
+
+th,
+td {
+  border: 1px solid #ccc;
+  padding: 10px;
+  text-align: left;
+}
+
+th {
+  background: #1f4e79;
+  color: white;
+}
+
+@media (min-width: 800px) {
+  main {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .card:last-child {
+    grid-column: span 2;
+  }
+}
+
+frontend/app.ts
+const API_URL = "http://localhost:3000";
+
+type ApiResponse = {
+  message?: string;
+  error?: string;
+  datetime?: string;
+  login?: string;
+  pointages?: {
+    type: "arrivee" | "depart";
+    datetime: string;
+  }[];
+};
+
+function getInputValue(id: string): string {
+  const input = document.getElementById(id) as HTMLInputElement;
+  return input.value.trim();
+}
+
+function showMessage(elementId: string, message: string, isError: boolean = false): void {
+  const element = document.getElementById(elementId) as HTMLElement;
+
+  element.textContent = message;
+  element.className = isError
+    ? "message error-message"
+    : "message success-message";
+}
+
+async function postData(route: string, data: object): Promise<ApiResponse> {
+  const response = await fetch(`${API_URL}${route}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(data)
+  });
+
+  const result = await response.json();
+
+  return result;
+}
+
+/**
+ * Création de compte
+ */
+const registerBtn = document.getElementById("registerBtn") as HTMLButtonElement;
+
+registerBtn.addEventListener("click", async () => {
+  const login = getInputValue("registerLogin");
+  const password = getInputValue("registerPassword");
+
+  if (!login || !password) {
+    showMessage("registerMessage", "Veuillez remplir tous les champs.", true);
+    return;
+  }
+
+  try {
+    const result = await postData("/register", {
+      login,
+      password
+    });
+
+    if (result.error) {
+      showMessage("registerMessage", result.error, true);
+    } else {
+      showMessage("registerMessage", result.message || "Compte créé.");
+    }
+  } catch (error) {
+    showMessage("registerMessage", "Erreur de connexion au serveur.", true);
+  }
+});
+
+/**
+ * Arrivée
+ */
+const arriveeBtn = document.getElementById("arriveeBtn") as HTMLButtonElement;
+
+arriveeBtn.addEventListener("click", async () => {
+  const login = getInputValue("pointageLogin");
+  const password = getInputValue("pointagePassword");
+
+  if (!login || !password) {
+    showMessage("pointageMessage", "Veuillez remplir tous les champs.", true);
+    return;
+  }
+
+  try {
+    const result = await postData("/arrivee", {
+      login,
+      password
+    });
+
+    if (result.error) {
+      showMessage("pointageMessage", result.error, true);
+    } else {
+      showMessage(
+        "pointageMessage",
+        `${result.message} Heure : ${result.datetime}`
+      );
+    }
+  } catch (error) {
+    showMessage("pointageMessage", "Erreur de connexion au serveur.", true);
+  }
+});
+
+/**
+ * Départ
+ */
+const departBtn = document.getElementById("departBtn") as HTMLButtonElement;
+
+departBtn.addEventListener("click", async () => {
+  const login = getInputValue("pointageLogin");
+  const password = getInputValue("pointagePassword");
+
+  if (!login || !password) {
+    showMessage("pointageMessage", "Veuillez remplir tous les champs.", true);
+    return;
+  }
+
+  try {
+    const result = await postData("/depart", {
+      login,
+      password
+    });
+
+    if (result.error) {
+      showMessage("pointageMessage", result.error, true);
+    } else {
+      showMessage(
+        "pointageMessage",
+        `${result.message} Heure : ${result.datetime}`
+      );
+    }
+  } catch (error) {
+    showMessage("pointageMessage", "Erreur de connexion au serveur.", true);
+  }
+});
+
+/**
+ * Visualisation des horaires
+ */
+const horairesBtn = document.getElementById("horairesBtn") as HTMLButtonElement;
+
+horairesBtn.addEventListener("click", async () => {
+  const login = getInputValue("horairesLogin");
+  const password = getInputValue("horairesPassword");
+  const horairesResult = document.getElementById("horairesResult") as HTMLElement;
+
+  horairesResult.innerHTML = "";
+
+  if (!login || !password) {
+    showMessage("horairesMessage", "Veuillez remplir tous les champs.", true);
+    return;
+  }
+
+  try {
+    const result = await postData("/horaires", {
+      login,
+      password
+    });
+
+    if (result.error) {
+      showMessage("horairesMessage", result.error, true);
+      return;
+    }
+
+    showMessage("horairesMessage", "Horaires récupérés avec succès.");
+
+    if (!result.pointages || result.pointages.length === 0) {
+      horairesResult.innerHTML = "<p>Aucun pointage trouvé.</p>";
+      return;
+    }
+
+    let html = `
+      <table>
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Date et heure</th>
+          </tr>
+        </thead>
+        <tbody>
+    `;
+
+    for (const pointage of result.pointages) {
+      const typeLabel = pointage.type === "arrivee" ? "Arrivée" : "Départ";
+
+      html += `
+        <tr>
+          <td>${typeLabel}</td>
+          <td>${pointage.datetime}</td>
+        </tr>
+      `;
+    }
+
+    html += `
+        </tbody>
+      </table>
+    `;
+
+    horairesResult.innerHTML = html;
+  } catch (error) {
+    showMessage("horairesMessage", "Erreur de connexion au serveur.", true);
+  }
+});
+
+pointeuse/
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── db.ts
+│   └── server.ts
+└── frontend/
+    ├── index.html
+    ├── style.css
+    └── app.ts
+
